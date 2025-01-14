@@ -2189,3 +2189,348 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 params={"error": str(e)}
             )
             return True  # Default to scrolling if check fails
+
+    async def stream_crawl(self, url: str, config: CrawlerRunConfig) -> AsyncCrawlResponse:
+        """
+        Stream crawl a given URL with the specified configuration.
+
+        Args:
+            url (str): The web URL to crawl
+            config (CrawlerRunConfig): Configuration object controlling the crawl behavior
+
+        Returns:
+            AsyncCrawlResponse: The response containing HTML, headers, status code, and optional data
+        """
+        config.url = url
+        response_headers = {}
+        status_code = None
+
+        # Reset downloaded files list for new crawl
+        self._downloaded_files = []
+
+        # Handle user agent with magic mode
+        user_agent = self.browser_config.user_agent
+        if config.magic and self.browser_config.user_agent_mode != "random":
+            self.browser_config.user_agent = UserAgentGenerator().generate(
+                **(self.browser_config.user_agent_generator_config or {})
+            )
+
+        # Get page for session
+        page, context = await self.browser_manager.get_page(crawlerRunConfig=config)
+
+        # Add default cookie
+        await context.add_cookies(
+            [{"name": "cookiesEnabled", "value": "true", "url": url}]
+        )
+
+        # Handle navigator overrides
+        if config.override_navigator or config.simulate_user or config.magic:
+            await context.add_init_script(load_js_script("navigator_overrider"))
+
+        # Call hook after page creation
+        await self.execute_hook("on_page_context_created", page, context=context)
+
+        # Set up console logging if requested
+        if config.log_console:
+
+            def log_consol(
+                msg, console_log_type="debug"
+            ):  # Corrected the parameter syntax
+                if console_log_type == "error":
+                    self.logger.error(
+                        message=f"Console error: {msg}",  # Use f-string for variable interpolation
+                        tag="CONSOLE",
+                        params={"msg": msg.text},
+                    )
+                elif console_log_type == "debug":
+                    self.logger.debug(
+                        message=f"Console: {msg}",  # Use f-string for variable interpolation
+                        tag="CONSOLE",
+                        params={"msg": msg.text},
+                    )
+
+            page.on("console", log_consol)
+            page.on("pageerror", lambda e: log_consol(e, "error"))
+
+        try:
+            # Get SSL certificate information if requested and URL is HTTPS
+            ssl_cert = None
+            if config.fetch_ssl_certificate:
+                ssl_cert = SSLCertificate.from_url(url)
+
+            # Set up download handling
+            if self.browser_config.accept_downloads:
+                page.on(
+                    "download",
+                    lambda download: asyncio.create_task(
+                        self._handle_download(download)
+                    ),
+                )
+
+            # Handle page navigation and content loading
+            if not config.js_only:
+                await self.execute_hook("before_goto", page, context=context, url=url)
+
+                try:
+                    # Generate a unique nonce for this request
+                    nonce = hashlib.sha256(os.urandom(32)).hexdigest()
+                    
+                    # Add CSP headers to the request
+                    await page.set_extra_http_headers({
+                        'Content-Security-Policy': f"default-src 'self'; script-src 'self' 'nonce-{nonce}' 'strict-dynamic'"
+                    })
+
+                    response = await page.goto(
+                        url, wait_until=config.wait_until, timeout=config.page_timeout
+                    )
+                except Error as e:
+                    raise RuntimeError(f"Failed on navigating ACS-GOTO:\n{str(e)}")
+
+                await self.execute_hook("after_goto", page, context=context, url=url, response=response)
+
+                if response is None:
+                    status_code = 200
+                    response_headers = {}
+                else:
+                    status_code = response.status
+                    response_headers = response.headers
+
+            else:
+                status_code = 200
+                response_headers = {}
+
+            # Wait for body element and visibility
+            try:
+                await page.wait_for_selector("body", state="attached", timeout=30000)
+                
+                # Use the new check_visibility function with csp_compliant_wait
+                is_visible = await self.csp_compliant_wait(
+                    page,
+                    """() => {
+                        const element = document.body;
+                        if (!element) return false;
+                        const style = window.getComputedStyle(element);
+                        const isVisible = style.display !== 'none' && 
+                                        style.visibility !== 'hidden' && 
+                                        style.opacity !== '0';
+                        return isVisible;
+                    }""",
+                    timeout=30000
+                )
+                
+                if not is_visible and not config.ignore_body_visibility:
+                    visibility_info = await self.check_visibility(page)
+                    raise Error(f"Body element is hidden: {visibility_info}")
+
+            except Error as e:
+                visibility_info = await self.check_visibility(page)
+                
+                if self.config.verbose:
+                    self.logger.debug(
+                        message="Body visibility info: {info}",
+                        tag="DEBUG",
+                        params={"info": visibility_info},
+                    )
+
+                if not config.ignore_body_visibility:
+                    raise Error(f"Body element is hidden: {visibility_info}")            
+            
+            
+            # Handle content loading and viewport adjustment
+            if not self.browser_config.text_mode and (
+                config.wait_for_images or config.adjust_viewport_to_content
+            ):
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(0.1)
+                
+                # Check for image loading with improved error handling
+                images_loaded = await self.csp_compliant_wait(
+                    page,
+                    "() => Array.from(document.getElementsByTagName('img')).every(img => img.complete)",
+                    timeout=1000
+                )
+                
+                if not images_loaded and self.logger:
+                    self.logger.warning(
+                        message="Some images failed to load within timeout",
+                        tag="SCRAPE",
+                    )
+
+            # Adjust viewport if needed
+            if not self.browser_config.text_mode and config.adjust_viewport_to_content:
+                try:
+                    dimensions = await self.get_page_dimensions(page)
+                    page_height = dimensions['height']
+                    page_width = dimensions['width']                    
+
+                    target_width = self.browser_config.viewport_width
+                    target_height = int(target_width * page_width / page_height * 0.95)
+                    await page.set_viewport_size(
+                        {"width": target_width, "height": target_height}
+                    )
+
+                    scale = min(target_width / page_width, target_height / page_height)
+                    cdp = await page.context.new_cdp_session(page)
+                    await cdp.send(
+                        "Emulation.setDeviceMetricsOverride",
+                        {
+                            "width": page_width,
+                            "height": page_height,
+                            "deviceScaleFactor": 1,
+                            "mobile": False,
+                            "scale": scale,
+                        },
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        message="Failed to adjust viewport to content: {error}",
+                        tag="VIEWPORT",
+                        params={"error": str(e)},
+                    )
+
+            # Handle full page scanning
+            if config.scan_full_page:
+                await self._handle_full_page_scan(page, config.scroll_delay)
+
+            # Execute JavaScript if provided
+            if config.js_code:
+                execution_result = await self.robust_execute_user_script(page, config.js_code)
+                if not execution_result["success"]:
+                    self.logger.warning(
+                        message="User script execution had issues: {error}",
+                        tag="JS_EXEC",
+                        params={"error": execution_result.get("error")}
+                    )                        
+
+                await self.execute_hook("on_execution_started", page, context=context)
+
+            # Handle user simulation
+            if config.simulate_user or config.magic:
+                await page.mouse.move(100, 100)
+                await page.mouse.down()
+                await page.mouse.up()
+                await page.keyboard.press("ArrowDown")
+
+            # Handle wait_for condition
+            if config.wait_for:
+                try:
+                    await self.smart_wait(
+                        page, config.wait_for, timeout=config.page_timeout
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"Wait condition failed: {str(e)}")
+
+            # Update image dimensions if needed
+            if not self.browser_config.text_mode:
+                update_image_dimensions_js = load_js_script("update_image_dimensions")
+                try:
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=5)
+                    except PlaywrightTimeoutError:
+                        pass
+                    await page.evaluate(update_image_dimensions_js)
+                except Exception as e:
+                    self.logger.error(
+                        message="Error updating image dimensions: {error}",
+                        tag="ERROR",
+                        params={"error": str(e)},
+                    )
+
+            # Process iframes if needed
+            if config.process_iframes:
+                page = await self.process_iframes(page)
+
+            # Pre-content retrieval hooks and delay
+            await self.execute_hook("before_retrieve_html", page, context=context)
+            if config.delay_before_return_html:
+                await asyncio.sleep(config.delay_before_return_html)
+
+            # Handle overlay removal
+            if config.remove_overlay_elements:
+                await self.remove_overlay_elements(page)
+
+            # Get final HTML content
+            html = await page.content()
+            await self.execute_hook("before_return_html", page = page, html = html, context=context)
+
+            # Handle PDF and screenshot generation
+            start_export_time = time.perf_counter()
+            pdf_data = None
+            screenshot_data = None
+
+            if config.pdf:
+                pdf_data = await self.export_pdf(page)
+
+            if config.screenshot:
+                if config.screenshot_wait_for:
+                    await asyncio.sleep(config.screenshot_wait_for)
+                screenshot_data = await self.take_screenshot(
+                    page, screenshot_height_threshold=config.screenshot_height_threshold
+                )
+
+            if screenshot_data or pdf_data:
+                self.logger.info(
+                    message="Exporting PDF and taking screenshot took {duration:.2f}s",
+                    tag="EXPORT",
+                    params={"duration": time.perf_counter() - start_export_time},
+                )
+
+            # Define delayed content getter
+            async def get_delayed_content(delay: float = 5.0) -> str:
+                self.logger.info(
+                    message="Waiting for {delay} seconds before retrieving content for {url}",
+                    tag="INFO",
+                    params={"delay": delay, "url": url},
+                )
+                await asyncio.sleep(delay)
+                return await page.content()
+
+            # Return complete response
+            return AsyncCrawlResponse(
+                html=html,
+                response_headers=response_headers,
+                status_code=status_code,
+                screenshot=screenshot_data,
+                pdf_data=pdf_data,
+                get_delayed_content=get_delayed_content,
+                ssl_certificate=ssl_cert,
+                downloaded_files=(
+                    self._downloaded_files if self._downloaded_files else None
+                ),
+            )
+
+        except Exception as e:
+            raise e
+        
+        finally:
+            # If no session_id is given we should close the page
+            if not config.session_id:
+                await page.close()
+
+    async def _generate_screenshot_from_html(self, html: str) -> str:
+        """
+        Generate a screenshot from raw HTML content.
+
+        Args:
+            html (str): The raw HTML content
+
+        Returns:
+            str: The base64-encoded screenshot data
+        """
+        # Create a temporary HTML file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file:
+            temp_file.write(html.encode("utf-8"))
+            temp_file_path = temp_file.name
+
+        # Use Playwright to open the temporary HTML file and take a screenshot
+        browser = await self.browser_manager.playwright.chromium.launch()
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto(f"file://{temp_file_path}")
+        screenshot_data = await page.screenshot()
+        await browser.close()
+
+        # Delete the temporary HTML file
+        os.remove(temp_file_path)
+
+        return base64.b64encode(screenshot_data).decode("utf-8")
